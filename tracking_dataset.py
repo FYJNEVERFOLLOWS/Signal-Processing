@@ -16,7 +16,7 @@ import random
 import numpy as np
 import os
 from collections import namedtuple
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import torch
 import scipy
 import scipy.io.wavfile
@@ -28,12 +28,37 @@ from matplotlib import animation
 from mpl_toolkits.mplot3d import Axes3D
 import webrtcvad
 
-from utils import rms_angular_error_deg
+# from utils import rms_angular_error_deg
 
 import gpuRIR
 
 
 # %% Util functions
+def angular_error(the_pred, phi_pred, the_true, phi_true):
+	""" Angular distance between spherical coordinates.
+	"""
+	aux = torch.cos(the_true) * torch.cos(the_pred) + \
+		  torch.sin(the_true) * torch.sin(the_pred) * torch.cos(phi_true - phi_pred)
+
+	return torch.acos(torch.clamp(aux, -0.99999, 0.99999))
+
+def mean_square_angular_error(y_pred, y_true):
+	""" Mean square angular distance between spherical coordinates.
+	Each row contains one point in format (elevation, azimuth).
+	"""
+	the_true = y_true[:, 0]
+	phi_true = y_true[:, 1]
+	the_pred = y_pred[:, 0]
+	phi_pred = y_pred[:, 1]
+
+	return torch.mean(torch.pow(angular_error(the_pred, phi_pred, the_true, phi_true), 2), -1)
+
+def rms_angular_error_deg(y_pred, y_true):
+	""" Root mean square angular distance between spherical coordinates.
+	Each input row contains one point in format (elevation, azimuth) in radians
+	but the output is in degrees.
+	"""
+	return torch.sqrt(mean_square_angular_error(y_pred, y_true)) * 180 / pi
 
 def acoustic_power(s):
 	""" Acoustic power of after removing the silences.
@@ -592,8 +617,8 @@ class LibriSpeechDataset(Dataset):
 		# if np.count_nonzero(s_clean) < len(s_clean) * 0.66:
 		# 	s_clean, vad_out = self._cleanSilences(s, 1, return_vad=True)
 
-		print(f'self.chapterList {len(self.chapterList)}')
-		print(f'spk1_id {spk1_id} self.reader2chapter[spk1_id] len {len(self.reader2chapter[spk1_id])}')
+		# print(f'self.chapterList {len(self.chapterList)}')
+		# print(f'spk1_id {spk1_id} self.reader2chapter[spk1_id] len {len(self.reader2chapter[spk1_id])}')
 
 		candidate_chapters = copy.deepcopy(self.chapterList)
 		for chap in self.reader2chapter[spk1_id]:
@@ -605,7 +630,7 @@ class LibriSpeechDataset(Dataset):
 			if list(candidate_chapter.values()):
 				filtered_candidates.append(list(candidate_chapter.values()))
 		
-		print(f'filtered_candidates {len(filtered_candidates)} ')
+		# print(f'filtered_candidates {len(filtered_candidates)} ')
 		random.shuffle(filtered_candidates)
 		chapter = filtered_candidates[0]
 
@@ -626,7 +651,7 @@ class LibriSpeechDataset(Dataset):
 		s2 -= s2.mean()
 		spk2_id = utt_paths[n].split('/')[-3]
 		utt2_id = utt_paths[n].split('/')[-1].split('.')[0]
-		print(f'spk1_id {spk1_id} spk2_id {spk2_id} utt1_id {utt1_id} utt2_id {utt2_id}')
+		# print(f'spk1_id {spk1_id} spk2_id {spk2_id} utt1_id {utt1_id} utt2_id {utt2_id}')
 		return s1, s2
 		# return (s_clean, vad_out) if self.return_vad else s_clean
 
@@ -684,15 +709,42 @@ class RandomTrajectoryDataset(Dataset):
 		# Microphones
 		array_pos = self.array_pos.getValue() * room_sz
 		mic_pos = array_pos + self.array_setup.mic_pos
-		
-		acoustic_scene1 = self.getRandomScene(idx, room_sz, T60, abs_weights, beta, array_pos, mic_pos)
+		# print(f'array_pos {array_pos}')
+		s1_signal, s2_signal = self.sourceDataset[idx]
+		acoustic_scene1 = self.getRandomScene(s1_signal, room_sz, T60, abs_weights, beta, array_pos, mic_pos)
 		mic_signals_s1 = acoustic_scene1.simulate()
+		acoustic_scene2 = self.getRandomScene(s2_signal, room_sz, T60, abs_weights, beta, array_pos, mic_pos)
+		mic_signals_s2 = acoustic_scene2.simulate()
 
-		if self.transforms is not None:
-			for t in self.transforms:
-				Xw, acoustic_scene = t(mic_signals_s1, acoustic_scene)
-		print(f'acoustic_scene.DOAw {np.rad2deg(acoustic_scene.DOAw)}')
-		return mic_signals_s1, acoustic_scene
+		# if self.transforms is not None:
+		# 	for t in self.transforms:
+		# 		Xw, acoustic_scene = t(mic_signals_s1, acoustic_scene)
+		# print(f'acoustic_scene.DOAw {np.rad2deg(acoustic_scene.DOAw)}')
+		mic_signals_s1 = torch.from_numpy(mic_signals_s1).transpose(1, 0)
+		mic_signals_s2 = torch.from_numpy(mic_signals_s2).transpose(1, 0)
+		# [N, C, T]
+		all_sources = torch.stack([mic_signals_s1, mic_signals_s2], dim=0)
+		mixture_signal = torch.sum(all_sources, dim=0)
+		num_channels = self.array_setup.mic_pos.shape[0]
+		scale = 0.5
+		for channel_idx in range(num_channels):
+			monarual_mixture_wav = mixture_signal[channel_idx,:]
+			max_amp = torch.max(torch.abs(monarual_mixture_wav))
+			if max_amp == 0:
+				max_amp = 1
+			mix_scale = 1/max_amp*scale
+			mixture_signal[channel_idx, :] = mixture_signal[channel_idx, :] * mix_scale
+			mic_signals_s1[channel_idx, :] = mic_signals_s1[channel_idx, :] * mix_scale
+			mic_signals_s2[channel_idx, :] = mic_signals_s2[channel_idx, :] * mix_scale
+		target_1 = mic_signals_s1[0, :]
+		target_2 = mic_signals_s2[0, :]
+
+		return  {
+            "mixture": mixture_signal, 
+            "target_1": target_1, 
+            "target_2": target_2,
+            # "wave_paths": wave_paths,
+        }
 
 	def get_batch(self, idx1, idx2):
 		mic_sig_batch = []
@@ -705,12 +757,10 @@ class RandomTrajectoryDataset(Dataset):
 		return np.stack(mic_sig_batch), np.stack(acoustic_scene_batch)
 
 	def getRandomScene(self, source_signal, room_sz, T60, abs_weights, beta, array_pos, mic_pos):
-		# Source signal
-		# source_signal, vad = self.sourceDataset[idx]
-
 		# Trajectory points
 		src_pos_min = np.array([max(0, array_pos[0]-5), max(0, array_pos[1]-5), 1.0])
 		src_pos_max = np.array([min(room_sz[0], array_pos[0]+5), min(room_sz[1], array_pos[1]+5), 1.8])
+		# print(f'src_pos_min {src_pos_min} src_pos_max {src_pos_max}')
 		# src_pos_min = np.array([0.0, 0.0, 0.0])
 		# src_pos_max = room_sz
 		if self.array_setup.arrayType == 'planar':
@@ -720,6 +770,7 @@ class RandomTrajectoryDataset(Dataset):
 				src_pos_max[np.nonzero(self.array_setup.orV)] = array_pos[np.nonzero(self.array_setup.orV)]
 		src_pos_ini = src_pos_min + np.random.random(3) * (src_pos_max - src_pos_min)
 		src_pos_end = src_pos_min + np.random.random(3) * (src_pos_max - src_pos_min)
+		# print(f'src_pos_ini {src_pos_ini} src_pos_end {src_pos_end}')
 
 		Amax = np.min(np.stack((src_pos_ini - src_pos_min,
 									  src_pos_max - src_pos_ini,
@@ -756,7 +807,7 @@ class RandomTrajectoryDataset(Dataset):
 			trajectory = trajectory,
 			DOA = cart2sph(trajectory - array_pos) [:,1:3]
 		)
-		acoustic_scene.source_vad = vad
+		# acoustic_scene.source_vad = vad
 
 		return acoustic_scene
 
@@ -1049,9 +1100,55 @@ def animate_trajectory(theta, phi, srp_maps, fps, DOA=None, DOA_est=None, DOA_sr
 	plt.close(fig)
 	if file_name is not None: anim.save(file_name, fps=fps, extra_args=['-vcodec', 'libx264'])
 
+def make_loader(path, T, size=None, return_vad=False, readers_range=None, batch_size=4, shuffle=True, num_workers=0):
+	K = 4096  # Window size
+	corpus = LibriSpeechDataset(path, T, size=size, return_vad=False, readers_range=None)
+	windowing = Windowing(K, K*3//4, window=np.hanning)
+	dataset = RandomTrajectoryDataset(
+		sourceDataset = corpus,
+		room_sz = Parameter([3,3,2.5], [12,9,5]),  	# Random room sizes from 3x3x2.5 to 10x8x6 meters
+		T60 = Parameter(0.2, 1.3),					# Random reverberation times from 0.2 to 1.3 seconds
+		abs_weights = Parameter([0.5]*6, [1.0]*6),  # Random absorption weights ratios between walls
+		array_setup = dummy_array_setup,
+		array_pos = Parameter([0.1, 0.1, 0.4], [0.9, 0.9, 0.8]), # Ensure a minimum separation between the array and the walls
+		SNR = Parameter(30), 	# Start the simulation with a low level of omnidirectional noise
+		nb_points = 156,		# Simulate 156 RIRs per trajectory (independent from the SRP-PHAT window length
+		transforms = [windowing]
+	)
+	loader = DataLoader(
+		dataset,
+		batch_size = batch_size,
+		shuffle = shuffle,
+		num_workers = num_workers,
+		drop_last = False
+	)
+	return loader
+
 if __name__ == "__main__":
+	K = 4096  # Window size
 	corpus_test = LibriSpeechDataset("/CDShare3/LibriSpeech/test-clean", 4, return_vad=True)
-	for idx, (source_sig, vad) in enumerate(corpus_test):
-		# print(f'source_sig {source_sig.shape}')
+	# for idx, (s1, s2) in enumerate(corpus_test):
+	# 	# print(f'source_sig {source_sig.shape}')
+	# 	if idx > 15:
+	# 		break
+	windowing = Windowing(K, K*3//4, window=np.hanning)
+
+	tracking_tesetset = RandomTrajectoryDataset(
+		sourceDataset = corpus_test,
+		room_sz = Parameter([3,3,2.5], [12,9,5]),  	# Random room sizes from 3x3x2.5 to 10x8x6 meters
+		T60 = Parameter(0.2, 1.3),					# Random reverberation times from 0.2 to 1.3 seconds
+		abs_weights = Parameter([0.5]*6, [1.0]*6),  # Random absorption weights ratios between walls
+		array_setup = dummy_array_setup,
+		array_pos = Parameter([0.1, 0.1, 0.4], [0.9, 0.9, 0.8]), # Ensure a minimum separation between the array and the walls
+		SNR = Parameter(30), 	# Start the simulation with a low level of omnidirectional noise
+		nb_points = 156,		# Simulate 156 RIRs per trajectory (independent from the SRP-PHAT window length
+		transforms = [windowing]
+	)
+
+	for idx, egs in enumerate(tracking_tesetset):
+		mixture = egs["mixture"]
+		s1 = egs["target_1"]
+		s2 = egs["target_2"]
+		print(f'idx {idx} s1 {s1.shape} s2 {s2.shape}')
 		if idx > 15:
 			break
